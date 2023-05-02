@@ -10,3 +10,10 @@ This generally works for GPUs, and it quite OK for CPUs as long as
 the working set stays in L3 cache (vs fused kernels).  The benefit is
 kernel reusability.
 
+
+# TODO
+
+- add bold filter
+- ispc versions of opencl kernels
+- ispc pcg or philox
+- add & defuse mpr delay
