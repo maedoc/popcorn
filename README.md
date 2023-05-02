@@ -9,3 +9,4 @@ parallelism:
 This generally works for GPUs, and it quite OK for CPUs as long as
 the working set stays in L3 cache (vs fused kernels).  The benefit is
 kernel reusability.
+

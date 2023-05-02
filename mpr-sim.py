@@ -114,7 +114,7 @@ def main():
     dt = 0.1
     r_noise_scale = 0.1
     nvtx = SC.shape[0]
-    num_sims = 32
+    num_sims = 256
 
     # prepare the GPU arrays and stepping function
     util, step = make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale)
@@ -126,8 +126,9 @@ def main():
     # run the simulation
     import time
     tic = time.time()
-    niter = 200
-    nskip = 1
+    minute = int(60e3 / dt)
+    niter = minute*15           # simulate 15 minutes
+    nskip = int(1.8*1e3/dt)     # pretend it's a Bold Tr=1.8s (TODO add bold kernel)
     rs = np.lib.format.open_memmap(
             'rs.npy', mode='w+', dtype='f',
             shape=(niter//nskip, nvtx, num_sims))
