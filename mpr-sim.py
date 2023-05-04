@@ -56,9 +56,12 @@ def make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale):
 
     util = Util()
     # allocate required memory for states & Heun integration
-    util.init_vectors('nr nV r V ri Vi cr cV dr1 dV1 dr2 dV2 zr zV', (nvtx, num_sims))
+    util.init_vectors('nr nV r V ri Vi cr cV dr1 dV1 dr2 dV2 zr zV bold', (nvtx, num_sims))
+    # alloc balloon state
+    util.init_vectors('dsfvq1 dsfvq2 sfvqi sfvq zsfvq', (4, nvtx, num_sims))
+    util.sfvq[1:] = np.float32(1.0)
     # eta is the only varying parameter for now
-    util.init_vectors('params', (nvtx, num_sims), 'randn', mu=-5.0, sigma=0.1)
+    util.init_vectors('params', (nvtx, num_sims), 'randn', mu=-6.0, sigma=0.1)
     # move sparse matrix data to GPU
     util.move_csr('sc', SC)
     util.move_csr('lc', LC)
@@ -66,9 +69,10 @@ def make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale):
     util.load_kernel('./spmv.opencl.c', 'spmv')
     util.load_kernel('./mpr.opencl.c', 'mpr_dfun')
     util.load_kernel('./heun.opencl.c', 'heun_pred', 'heun_corr')
+    util.load_kernel('./balloon.opencl.c', 'balloon_dfun', 'balloon_readout')
 
     # handle boilerplate for kernel launches
-    def do(f, *args):
+    def do(f, *args, nvtx=nvtx):
         args = [(arg.data if hasattr(arg, 'data') else arg) for arg in args]
         f(util.queue, (nvtx, num_sims), (1, num_sims), *args)
 
@@ -103,13 +107,34 @@ def make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale):
         do(util.heun_corr, dt, util.r, util.r, util.dr1, util.dr2, util.zr)
         do(util.heun_corr, dt, util.V, util.V, util.dV1, util.dV2, util.zV)
 
-    return util, step
+    def bold_step(dt):
+        "Do one step of the balloon model."
+        dt = np.float32(dt)
+        # do Heun step on balloon model, using r as neural input
+        do(util.balloon_dfun, util.dsfvq1, util.sfvq, util.r)
+        do(util.heun_pred, dt, util.sfvqi, util.sfvq, util.dsfvq1, util.zsfvq, nvtx=4*nvtx)
+        do(util.balloon_dfun, util.dsfvq2, util.sfvqi, util.r)
+        do(util.heun_corr, dt, util.sfvq, util.sfvq, util.dsfvq1, util.dsfvq2, util.zsfvq, nvtx=4*nvtx)
+        # update bold signal
+        do(util.balloon_readout, util.sfvq, util.bold)
+
+    return util, step, bold_step
 
 
 def main():
+
+    # load the global and local connectivity matrices
     mat = scipy.io.loadmat('matrices.mat')
     SC = mat['SC']
     LC = mat['LC']
+
+    if False:
+        # for testing, can run just a subset of the network, like first 512
+        # vertices, but could also be a mask selecting just 5 regions, etc.
+        nvtx = 512
+        SC = SC[:nvtx, :nvtx]
+        LC = LC[:nvtx, :nvtx]
+        print('reduced network shape to', SC.shape, LC.shape)
 
     dt = 0.1
     r_noise_scale = 0.1
@@ -117,25 +142,48 @@ def main():
     num_sims = 256
 
     # prepare the GPU arrays and stepping function
-    util, step = make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale)
+    util, step, bold_step = make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale)
 
     # set initial conditions
     util.rng.fill_normal(util.r, mu=0.1, sigma=0.2)
     util.rng.fill_normal(util.V, mu=-2.1, sigma=0.2)
 
-    # run the simulation
+    # simulation times
     import time
     tic = time.time()
     minute = int(60e3 / dt)
-    niter = minute*15           # simulate 15 minutes
-    nskip = int(1.8*1e3/dt)     # pretend it's a Bold Tr=1.8s (TODO add bold kernel)
+
+    # neural field iterations & output storage
+    niter = 15*minute  # this many iterations
+    nskip = int(10/dt)       # but only save every nskip iterations to file
+    rs_shape = niter//nskip+1, nvtx, num_sims
+    print(f'output rs.npy ~{(np.prod(rs_shape)*4) >> 30} GB')
     rs = np.lib.format.open_memmap(
             'rs.npy', mode='w+', dtype='f',
-            shape=(niter//nskip, nvtx, num_sims))
+            shape=rs_shape)
+
+    # bold iterations & output storage 
+    bold_dtskip = 180
+    bold_nskip = int(180/dt)         # sample bold every 180 ms
+    bolds_shape = niter//bold_nskip+1, nvtx, num_sims
+    print(f'output bolds.npy ~{(np.prod(bolds_shape)*4) >> 30} GB')
+    bolds = np.lib.format.open_memmap(
+            'bolds.npy', mode='w+', dtype='f',
+            shape=bolds_shape)
+
+    # do time stepping
     for i in tqdm.trange(niter):
         step()
+        # bold is slow, don't step it every time
+        if i % bold_dtskip == 0:
+            bold_step(dt*1e-3*bold_dtskip)
+        # save bold & states every few steps
+        if i % bold_nskip == 0:
+            util.bold.get_async(util.queue, bolds[i//bold_nskip])
         if i % nskip == 0:
             util.r.get_async(util.queue, rs[i//nskip])
+
+    # opencl operations are asynchronous, wait for everything to finish & report time
     print('finishing...')
     util.queue.finish()
     toc = time.time() - tic
@@ -144,10 +192,23 @@ def main():
 if __name__ == '__main__':
     main()
 
+    import numpy as np
     import pylab as pl
     rs = np.lib.format.open_memmap('rs.npy')
+    bolds = np.lib.format.open_memmap('bolds.npy')
+
+    pl.figure()
     for i in range(25):
         pl.subplot(5, 5, i + 1)
-        pl.plot(rs[:, ::100, i], 'k', alpha=0.1)
+        pl.plot(rs[::100, ::100, i], 'k', alpha=0.1)
+
+    pl.suptitle('r')
+    pl.tight_layout()
+    pl.figure()
+    for i in range(25):
+        pl.subplot(5, 5, i + 1)
+        pl.plot(bolds[:, ::100, i], 'k', alpha=0.1)
+
+    pl.suptitle('bold')
     pl.tight_layout()
     pl.show()
