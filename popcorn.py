@@ -12,7 +12,7 @@ ivec = np.ctypeslib.ndpointer(dtype=np.int32)
 
 # TODO use temp lib directories for builds
 def build_spmv_ispc(isa=None):
-	os.system('ispc -g spmv.ispc --target=neon-i32x8 --pic -O3 -o spmv.ispc.o')
+	os.system('ispc -g spmv.ispc --pic -O3 -o spmv.ispc.o')
 	os.system('g++ -std=c++11 -fPIC -c tasksys.cpp')
 	os.system('g++ -shared tasksys.o spmv.ispc.o -o spmv.ispc.so -lpthread')
 	lib = ctypes.CDLL('./spmv.ispc.so')
