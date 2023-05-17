@@ -10,6 +10,9 @@ This generally works for GPUs, and it quite OK for CPUs as long as
 the working set stays in L3 cache (vs fused kernels).  The benefit is
 kernel reusability.
 
+ISPC & OpenCL aren't the hot parallel APIs these days but they do cover
+available hardware (CPU, m1 GPU, Intel GPU, NVidia & AMD) with a
+simple programming model.
 
 # TODO
 
