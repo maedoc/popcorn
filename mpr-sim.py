@@ -6,46 +6,7 @@ A hi-res MPR w/ two sparse coupling matrices.
 import numpy as np
 import scipy.io
 import tqdm
-import pyopencl as cl
-import pyopencl.array as ca
-import pyopencl.clrandom as cr
-
-
-class Util:
-
-    def __init__(self):
-        self.init_cl()
-        self._progs = []
-
-    def init_cl(self):
-        self.platform = cl.get_platforms()[0]
-        self.device = self.platform.get_devices(device_type=cl.device_type.GPU)[0]
-        self.context = cl.Context([self.device])
-        self.queue = cl.CommandQueue(self.context)
-        self.rng = cr.PhiloxGenerator(self.context)
-
-    def randn(self, *shape, mu=0, sigma=1):
-        return self.rng.normal(cq=self.queue, dtype='f', shape=shape, mu=mu, sigma=sigma)
-
-    def zeros(self, *shape):
-        return ca.zeros(self.queue, shape, dtype='f')
-
-    def init_vectors(self, names, shape, method='zeros', **kwargs):
-        for name in names.split(' '):
-            setattr(self, name, getattr(self, method)(*shape, **kwargs))
-
-    def load_kernel(self, fname, *knames):
-        with open(fname, 'r') as f:
-            src = f.read()
-        prog = cl.Program(self.context, src).build()
-        self._progs.append(prog)
-        for kname in knames:
-            setattr(self, kname, getattr(prog, kname))
-
-    def move_csr(self, name, csr):
-        setattr(self, name + '_data', ca.to_device(self.queue, csr.data))
-        setattr(self, name + '_indices', ca.to_device(self.queue, csr.indices))
-        setattr(self, name + '_indptr', ca.to_device(self.queue, csr.indptr))
+from clutils import *
 
 
 def make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale):
@@ -139,7 +100,7 @@ def main():
     dt = 0.1
     r_noise_scale = 0.1
     nvtx = SC.shape[0]
-    num_sims = 256
+    num_sims = 32
 
     # prepare the GPU arrays and stepping function
     util, step, bold_step = make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale)

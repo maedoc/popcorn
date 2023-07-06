@@ -1,6 +1,7 @@
 import tqdm
 import time
 import numpy as np
+#import cupy as cp
 
 # load data
 gdist = np.load('./vert2vert_gdist_mat_32k.npz')
@@ -33,6 +34,7 @@ print(f'MB gdist {gdist_data.nbytes*2/1e6:0.2f}, v2v {v2vL_data.nbytes*2/1e6:0.2
 print(f'Gdist min {gdist_data.min():.2f} mm, max {gdist_data.max():.2f} mm')
 print(f'v2v min {v2vL_data.min():.2f} mm, max {v2vL_data.max():.2f} mm')
 
+
 # look at distribution of min distance per vertex
 import scipy.sparse
 gdmin = np.array([gdist_data[gdist_indptr[i]:gdist_indptr[i+1]].min() for i in tqdm.trange(nvtx)])
@@ -64,10 +66,11 @@ lc_kernel = np.exp(-(gdist_data/3)**2)
 # benchmark numpy performance
 buf = np.zeros((nh, nvtx), dtype=np.float32)
 tic = time.time()
-niter = 5
+niter = 50
 for _ in tqdm.trange(niter):
     gc = np.add.reduceat(buf[v2vL_idelays, v2vL_indices]*v2vW_data, v2vL_indptr[:-1])
     lc = np.add.reduceat(buf[gdist_idelays, gdist_indices]*lc_kernel, gdist_indptr[:-1])
+
 toc = (time.time() - tic)/niter
 
 # membw & flop count proportional to nnz
@@ -79,7 +82,7 @@ print(f'{flop/toc/1e6:0.2f} Mflops, {membw/toc/1e9:0.2f} GB/s')
 
 # numba
 import numba as nb
-@nb.njit(parallel=True, fastmath=True, boundscheck=False)
+@nb.njit(parallel=True, fastmath=True, boundscheck=True)
 def compute_couplings(gc, lc, buf,
                       v2vL_idelays, v2vL_indices, v2vL_indptr, v2vW_data,
                       gdist_idelays, gdist_indices, gdist_indptr, lc_kernel):
@@ -99,11 +102,13 @@ lc = np.zeros(nvtx, dtype=np.float32)
 run_nb = lambda : compute_couplings(gc, lc, buf,
                       v2vL_idelays, v2vL_indices, v2vL_indptr, v2vW_data,
                       gdist_idelays, gdist_indices, gdist_indptr, lc_kernel)
+
 run_nb()
 tic = time.time()
 niter = 10
 for _ in tqdm.trange(niter):
     run_nb()
+
 toc = (time.time() - tic)/niter
 print(f'{flop/toc/1e6:0.2f} Mflops, {membw/toc/1e9:0.2f} GB/s')
 # about 111 Mflops, 0.89 GB/s

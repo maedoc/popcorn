@@ -1,2 +1,6 @@
 *.mat filter=lfs diff=lfs merge=lfs -text
 *.npz.age filter=lfs diff=lfs merge=lfs -text
+fibre2vertex_assignment_32k_15M.npz filter=lfs diff=lfs merge=lfs -text
+vert2vert_gdist_mat_32k.npz filter=lfs diff=lfs merge=lfs -text
+vert2vert_lengths_32k_15M.npz filter=lfs diff=lfs merge=lfs -text
+vert2vert_weights_32k_15M.npz filter=lfs diff=lfs merge=lfs -text
