@@ -1,5 +1,6 @@
 import os
 from cuda import cuda, nvrtc, cudart
+import numpy as np
 
 
 def _cudaGetErrorEnum(error):
