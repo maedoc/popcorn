@@ -30,7 +30,7 @@ class Util:
         with open(fname, 'r') as f:
             src = f.read()
         buildoptlist = []
-        for key, val in buildopts:
+        for key, val in buildopts.items():
             buildoptlist.extend(['-D', f'{key}={val}'])
         prog = cl.Program(self.context, src).build(buildoptlist)
         self._progs.append(prog)

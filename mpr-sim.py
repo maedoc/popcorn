@@ -37,7 +37,7 @@ def make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale):
     util.move_csr(W=W, K=K)
     util.move(iL=iL, iG=iG)
     # load kernels
-    util.load_kernel('./delays.opencl.c', 'delays_batched')
+    util.load_kernel('./delays.opencl.c', 'delays_batched', N=32, B=num_sims)
     util.load_kernel('./mpr.opencl.c', 'mpr_dfun')
     util.load_kernel('./heun.opencl.c', 'heun_pred', 'heun_corr')
     util.load_kernel('./balloon.opencl.c', 'balloon_dfun', 'balloon_readout')
@@ -51,13 +51,14 @@ def make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale):
         "Compute coupling terms."
 
         # delays_batched(nvtx, nh, t, out, buf, weights, idelays, indices, indptr)
+        t = np.int32(t)
 
         # global coupling transmits rate information
-        do(util.delays_batched, nvtx, nh_r, t, cr, util.rbuf,
-                util.W_data, util.iL_data, util.W_indices, util.W_indptr)
+        do(util.delays_batched, np.int32(nvtx), np.int32(nh_r), t, cr, util.rbuf,
+                util.W_data, util.iL, util.W_indices, util.W_indptr)
         # local coupling transmits potential
-        do(util.delays_batched, nvtx, nh_v, t, cv, util.vbuf,
-                util.K_data, util.iG_data, util.K_indices, util.K_indptr)
+        do(util.delays_batched, np.int32(nvtx), np.int32(nh_v), t, cV, util.vbuf,
+                util.K_data, util.iG, util.K_indices, util.K_indptr)
 
     def dfun(t, dr, dV, r, V):
         "Compute MPR derivatives."
@@ -69,7 +70,7 @@ def make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale):
 
         # update rbuf & vbuf
         util.rbuf[t%nh_r] = util.r
-        util.vbuf[t%nh_v] = util.v
+        util.vbuf[t%nh_v] = util.V
 
         # sample noise
         util.rng.fill_normal(util.zr, sigma=r_noise_scale)
@@ -119,7 +120,7 @@ def main():
     W = load_npz_to_csr('vert2vert_weights_32k_15M.npz')
     assert G.shape == L.shape == W.shape
 
-    if False:
+    if True:
         # for testing, can run just a subset of the network, like first 512
         # vertices, but could also be a mask selecting just 5 regions, etc.
         nvtx = 512
@@ -175,7 +176,7 @@ def main():
 
     # do time stepping
     for i in tqdm.trange(niter):
-        step()
+        step(i)
         # bold is slow, don't step it every time
         if i % bold_dtskip == 0:
             bold_step(dt*1e-3*bold_dtskip)
