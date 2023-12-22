@@ -37,8 +37,14 @@ class Util:
         for kname in knames:
             setattr(self, kname, getattr(prog, kname))
 
-    def move_csr(self, name, csr):
-        setattr(self, name + '_data', ca.to_device(self.queue, csr.data))
-        setattr(self, name + '_indices', ca.to_device(self.queue, csr.indices))
-        setattr(self, name + '_indptr', ca.to_device(self.queue, csr.indptr))
+    def move(self, **names):
+        for name, csr in names.items():
+            setattr(self, name, ca.to_device(self.queue, csr))
+
+
+    def move_csr(self, **names):
+        for name, csr in names.items():
+            setattr(self, name + '_data', ca.to_device(self.queue, csr.data))
+            setattr(self, name + '_indices', ca.to_device(self.queue, csr.indices))
+            setattr(self, name + '_indptr', ca.to_device(self.queue, csr.indptr))
 

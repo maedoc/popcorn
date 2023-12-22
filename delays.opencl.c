@@ -78,7 +78,8 @@ __kernel void delays_batched(
     int nchunks = (indptr[i+1] - indptr[i]) / N;
     acc[li*B+bi] = 0.0;
     for (int j=indptr[i]+li; j<indptr[i+1]; j+=N) {
-        acc[li*B+bi] += weights[j] * buf[((nh+t-idelays[j])*nvtx+indices[j])*B+bi];
+        int roll_t = (nh + t - idelays[j]) % nh;
+        acc[li*B+bi] += weights[j] * buf[(roll_t*nvtx+indices[j])*B+bi];
     }
     acc[li*B+bi] = local_reduce_add_batch(N, acc);
     if (li==0)

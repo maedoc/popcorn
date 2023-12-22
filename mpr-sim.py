@@ -4,30 +4,40 @@ A hi-res MPR w/ two sparse coupling matrices.
 """
 
 import numpy as np
-import scipy.io
+import scipy.sparse
 import tqdm
 from clutils import *
+import pyopencl.array as ca
 
 
-def make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale):
+def make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale):
     "Setup functions for time stepping."
 
     # CL kernels expect float32 scalars
     dt = np.float32(dt)
+    nh_r = iL.max() + 1
+    nh_v = iG.max() + 1
+
+    # max delay determines buffer size
+    print((nh_r + nh_v) * nvtx * num_sims * 4 >> 20, 'min buf size')
 
     util = Util()
     # allocate required memory for states & Heun integration
     util.init_vectors('nr nV r V ri Vi cr cV dr1 dV1 dr2 dV2 zr zV bold', (nvtx, num_sims))
+    # alloc delay buffers
+    util.init_vectors('rbuf', (nh_r, nvtx, num_sims))
+    util.init_vectors('vbuf', (nh_v, nvtx, num_sims))
+    util.vbuf[:] = np.float32(-2.0)
     # alloc balloon state
     util.init_vectors('dsfvq1 dsfvq2 sfvqi sfvq zsfvq', (4, nvtx, num_sims))
     util.sfvq[1:] = np.float32(1.0)
     # eta is the only varying parameter for now
     util.init_vectors('params', (nvtx, num_sims), 'randn', mu=-6.0, sigma=0.1)
     # move sparse matrix data to GPU
-    util.move_csr('sc', SC)
-    util.move_csr('lc', LC)
+    util.move_csr(W=W, K=K)
+    util.move(iL=iL, iG=iG)
     # load kernels
-    util.load_kernel('./spmv.opencl.c', 'spmv')
+    util.load_kernel('./delays.opencl.c', 'delays_batched')
     util.load_kernel('./mpr.opencl.c', 'mpr_dfun')
     util.load_kernel('./heun.opencl.c', 'heun_pred', 'heun_corr')
     util.load_kernel('./balloon.opencl.c', 'balloon_dfun', 'balloon_readout')
@@ -37,36 +47,47 @@ def make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale):
         args = [(arg.data if hasattr(arg, 'data') else arg) for arg in args]
         f(util.queue, (nvtx, num_sims), (1, num_sims), *args)
 
-    def coupling(cr, cV, r, V):
+    def coupling(t, cr, cV, r, V):
         "Compute coupling terms."
-        # global coupling transmits rate information
-        do(util.spmv, cr, r, util.sc_data, util.sc_indices, util.sc_indptr)
-        # local coupling transmits potential
-        do(util.spmv, cV, V, util.lc_data, util.lc_indices, util.lc_indptr)
 
-    def dfun(dr, dV, r, V):
+        # delays_batched(nvtx, nh, t, out, buf, weights, idelays, indices, indptr)
+
+        # global coupling transmits rate information
+        do(util.delays_batched, nvtx, nh_r, t, cr, util.rbuf,
+                util.W_data, util.iL_data, util.W_indices, util.W_indptr)
+        # local coupling transmits potential
+        do(util.delays_batched, nvtx, nh_v, t, cv, util.vbuf,
+                util.K_data, util.iG_data, util.K_indices, util.K_indptr)
+
+    def dfun(t, dr, dV, r, V):
         "Compute MPR derivatives."
-        coupling(util.cr, util.cV, r, V)
+        coupling(t, util.cr, util.cV, r, V)
         do(util.mpr_dfun, dr, dV, r, V, util.cr, util.cV, util.params)
 
-    def step():
+    def step(t):
         "Do one Heun step."
+
+        # update rbuf & vbuf
+        util.rbuf[t%nh_r] = util.r
+        util.vbuf[t%nh_v] = util.v
+
         # sample noise
         util.rng.fill_normal(util.zr, sigma=r_noise_scale)
 
         # predictor step computes dr1,dV1 from states r,V
-        dfun(util.dr1, util.dV1, util.r, util.V)
+        dfun(t, util.dr1, util.dV1, util.r, util.V)
 
         # and puts Euler result into intermediate arrays ri,Vi
         do(util.heun_pred, dt, util.ri, util.r, util.dr1, util.zr)
         do(util.heun_pred, dt, util.Vi, util.V, util.dV1, util.zV)
 
         # corrector step computes dr2,dV2 from intermediate states ri,Vi
-        dfun(util.dr2, util.dV2, util.ri, util.Vi)
+        dfun(t, util.dr2, util.dV2, util.ri, util.Vi)
 
         # and writes Heun result into arrays r,V
         do(util.heun_corr, dt, util.r, util.r, util.dr1, util.dr2, util.zr)
         do(util.heun_corr, dt, util.V, util.V, util.dV1, util.dV2, util.zV)
+
 
     def bold_step(dt):
         "Do one step of the balloon model."
@@ -82,28 +103,48 @@ def make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale):
     return util, step, bold_step
 
 
+def load_npz_to_csr(npz_fname):
+    npz = np.load(npz_fname)
+    csr = scipy.sparse.csr_matrix(
+        (npz['data'], npz['indices'], npz['indptr']),
+        shape=npz['shape'])
+    return csr.astype('f')
+
+
 def main():
 
     # load the global and local connectivity matrices
-    mat = scipy.io.loadmat('matrices.mat')
-    SC = mat['SC']
-    LC = mat['LC']
+    G = load_npz_to_csr('vert2vert_gdist_mat_32k.npz')
+    L = load_npz_to_csr('vert2vert_lengths_32k_15M.npz')
+    W = load_npz_to_csr('vert2vert_weights_32k_15M.npz')
+    assert G.shape == L.shape == W.shape
 
     if False:
         # for testing, can run just a subset of the network, like first 512
         # vertices, but could also be a mask selecting just 5 regions, etc.
         nvtx = 512
-        SC = SC[:nvtx, :nvtx]
-        LC = LC[:nvtx, :nvtx]
-        print('reduced network shape to', SC.shape, LC.shape)
+        G = G[:nvtx][:,:nvtx]
+        L = L[:nvtx][:,:nvtx]
+        W = W[:nvtx][:,:nvtx]
+        print('reduced network shape to', G.shape, L.shape, W.shape)
 
     dt = 0.1
     r_noise_scale = 0.1
-    nvtx = SC.shape[0]
+    nvtx = L.shape[0]
     num_sims = 32
 
+    # make lc kernel from gdist
+    K = G.copy()
+    K.data = np.exp(-K.data/5.0).astype('f')
+
+    # prepare extra info for delays
+    local_velocity = 1.0
+    v2v_velocity = 10.0
+    iG = (G.data / local_velocity / dt).astype('i') # rounds down
+    iL = (L.data / v2v_velocity / dt).astype('i')
+
     # prepare the GPU arrays and stepping function
-    util, step, bold_step = make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale)
+    util, step, bold_step = make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale)
 
     # set initial conditions
     util.rng.fill_normal(util.r, mu=0.1, sigma=0.2)
