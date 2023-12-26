@@ -93,3 +93,11 @@ def test_spmv_opencl(benchmark, L):
     benchmark.group = f'spmv L={L}'
     benchmark(run)
 
+
+@pytest.mark.parametrize('L', spmv_L)
+def test_spmv_cuda(benchmark, L):
+    matX = np.random.randn(nvtx, L).astype('f') + 1.0
+    benchmark.group = f'spmv cuda={L}'
+    matY = benchmark(popcorn.build_spmv_cuda, SC, matX, L)
+    if not np.allclose(matY, SC.dot(matX)):
+        raise ValueError("Error outside tolerance for host-device vectors")
