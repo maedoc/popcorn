@@ -57,7 +57,7 @@ float local_reduce_add_batch(
             l--;
             barrier(CLK_LOCAL_MEM_FENCE);
         }
-        l >>= 1;
+        l >>= 2;
         if (j < l)
             x[j*B+bi] += x[(j + l)*B+bi];
     }
@@ -66,6 +66,23 @@ float local_reduce_add_batch(
 }
 
 __kernel void delays_batched(
+    const int nvtx, const int nh, const int t,
+    __global float *out, __global float *buf, __global float *weights,
+    __global int *idelays, __global int *indices, __global int *indptr)
+{
+    int i = get_global_id(0);
+    int nb = get_local_size(1);
+    int bi = get_local_id(1);
+    float acc = 0.0f;
+    for (int j=indptr[i]; j<indptr[i+1]; j++) {
+        // int roll_t = (nh + t - idelays[j]) % nh;
+        int roll_t = (nh + t - idelays[j]) & (nh - 1);
+        acc += weights[j] * buf[(roll_t*nvtx+indices[j])*nb+bi];
+    }
+    out[i*nb+bi] = acc;
+}
+
+__kernel void delays_batched_broke(
     const int nvtx, const int nh, const int t,
     __global float *out, __global float *buf, __global float *weights,
     __global int *idelays, __global int *indices, __global int *indptr)

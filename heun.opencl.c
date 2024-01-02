@@ -34,3 +34,17 @@ __kernel void heun_corr(
     int idx = i*L + l;
     out[idx] = x[idx] + dt/2*(dx1[idx] + dx2[idx]) + sqrt(dt)*z[idx];
 }
+
+// limit state var range
+__kernel void rgt0(
+    __global float *r
+)
+{
+    int i = get_global_id(0); // node id
+    int N = get_global_size(0); // num nodes
+    int l = get_global_id(1); // lane / gpu thread
+    int L = get_global_size(1); // num lanes
+    int idx = i*L + l;
+    if (r[idx] < 0)
+            r[idx] = 0;
+}

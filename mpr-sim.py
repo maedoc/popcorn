@@ -26,6 +26,7 @@ def make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale):
     util.init_vectors('nr nV r V ri Vi cr cV dr1 dV1 dr2 dV2 zr zV bold', (nvtx, num_sims))
     # alloc delay buffers
     util.init_vectors('rbuf', (nh_r, nvtx, num_sims))
+    util.rbuf[:] = np.float32(0.1)
     util.init_vectors('vbuf', (nh_v, nvtx, num_sims))
     util.vbuf[:] = np.float32(-2.0)
     # alloc balloon state
@@ -39,7 +40,7 @@ def make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale):
     # load kernels
     util.load_kernel('./delays.opencl.c', 'delays_batched', N=32, B=num_sims)
     util.load_kernel('./mpr.opencl.c', 'mpr_dfun')
-    util.load_kernel('./heun.opencl.c', 'heun_pred', 'heun_corr')
+    util.load_kernel('./heun.opencl.c', 'heun_pred', 'heun_corr', 'rgt0')
     util.load_kernel('./balloon.opencl.c', 'balloon_dfun', 'balloon_readout')
 
     # handle boilerplate for kernel launches
@@ -54,15 +55,40 @@ def make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale):
         t = np.int32(t)
 
         # global coupling transmits rate information
+        import pdb; pdb.set_trace()
         do(util.delays_batched, np.int32(nvtx), np.int32(nh_r), t, cr, util.rbuf,
                 util.W_data, util.iL, util.W_indices, util.W_indptr)
         # local coupling transmits potential
-        do(util.delays_batched, np.int32(nvtx), np.int32(nh_v), t, cV, util.vbuf,
-                util.K_data, util.iG, util.K_indices, util.K_indptr)
+        #do(util.delays_batched, np.int32(nvtx), np.int32(nh_v), t, cV, util.vbuf,
+        #        util.K_data, util.iG, util.K_indices, util.K_indptr)
+
+    def numpy_delays(buf,nh,t,idelays,indices,weights,indptr,c):
+        xij = buf[(nh + t - idelays) % nh, indices]
+        wxij = xij*weights.reshape(-1, 1)
+        wxij = np.r_[wxij, np.zeros((1, num_sims), 'f')]
+        np.add.reduceat(wxij, indptr[:-1], axis=0, out=c)
+        c[np.argwhere(np.diff(indptr)==0)] = 0
 
     def dfun(t, dr, dV, r, V):
         "Compute MPR derivatives."
-        coupling(t, util.cr, util.cV, r, V)
+        if True:
+            util.cr[:] = 0.0
+            coupling(t, util.cr, util.cV, r, V)
+            cr1 = util.cr.get()
+            cr2 = np.zeros_like(cr1)
+
+            numpy_delays(util.rbuf.get(), nh_r, t, iL, W.indices, W.data, W.indptr, cr2)
+
+            if t % 10 == 0:
+                print('cr1 finite', np.isfinite(cr1).all())
+                print('cr2 finite', np.isfinite(cr2).all())
+                err = np.abs(cr1 - cr2)
+                print(err)
+
+                import pylab as pl
+                pl.semilogy(err + 1e-9, ',')
+                pl.show()
+
         do(util.mpr_dfun, dr, dV, r, V, util.cr, util.cV, util.params)
 
     def step(t):
@@ -73,20 +99,22 @@ def make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale):
         util.vbuf[t%nh_v] = util.V
 
         # sample noise
-        util.rng.fill_normal(util.zr, sigma=r_noise_scale)
+        #util.rng.fill_normal(util.zr, sigma=r_noise_scale)
 
         # predictor step computes dr1,dV1 from states r,V
         dfun(t, util.dr1, util.dV1, util.r, util.V)
 
         # and puts Euler result into intermediate arrays ri,Vi
         do(util.heun_pred, dt, util.ri, util.r, util.dr1, util.zr)
+        do(util.rgt0, util.ri)
         do(util.heun_pred, dt, util.Vi, util.V, util.dV1, util.zV)
 
         # corrector step computes dr2,dV2 from intermediate states ri,Vi
-        dfun(t, util.dr2, util.dV2, util.ri, util.Vi)
+        dfun(t+1, util.dr2, util.dV2, util.ri, util.Vi)
 
         # and writes Heun result into arrays r,V
         do(util.heun_corr, dt, util.r, util.r, util.dr1, util.dr2, util.zr)
+        do(util.rgt0, util.r)
         do(util.heun_corr, dt, util.V, util.V, util.dV1, util.dV2, util.zV)
 
 
@@ -119,11 +147,13 @@ def main():
     L = load_npz_to_csr('vert2vert_lengths_32k_15M.npz')
     W = load_npz_to_csr('vert2vert_weights_32k_15M.npz')
     assert G.shape == L.shape == W.shape
+    assert np.allclose(W.indices, L.indices)
+    assert np.allclose(W.indptr, L.indptr)
 
     if True:
         # for testing, can run just a subset of the network, like first 512
         # vertices, but could also be a mask selecting just 5 regions, etc.
-        nvtx = 512
+        nvtx = 10*1024
         G = G[:nvtx][:,:nvtx]
         L = L[:nvtx][:,:nvtx]
         W = W[:nvtx][:,:nvtx]
@@ -132,7 +162,7 @@ def main():
     dt = 0.1
     r_noise_scale = 0.1
     nvtx = L.shape[0]
-    num_sims = 32
+    num_sims = 1
 
     # make lc kernel from gdist
     K = G.copy()
@@ -148,7 +178,7 @@ def main():
     util, step, bold_step = make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale)
 
     # set initial conditions
-    util.rng.fill_normal(util.r, mu=0.1, sigma=0.2)
+    util.rng.fill_uniform(util.r, a=0.00001, b=0.2)
     util.rng.fill_normal(util.V, mu=-2.1, sigma=0.2)
 
     # simulation times
@@ -157,8 +187,8 @@ def main():
     minute = int(60e3 / dt)
 
     # neural field iterations & output storage
-    niter = 15*minute  # this many iterations
-    nskip = int(10/dt)       # but only save every nskip iterations to file
+    niter = 2000 # minute  # this many iterations
+    nskip = 1 #int(10/dt)       # but only save every nskip iterations to file
     rs_shape = niter//nskip+1, nvtx, num_sims
     print(f'output rs.npy ~{(np.prod(rs_shape)*4) >> 30} GB')
     rs = np.lib.format.open_memmap(
@@ -201,17 +231,9 @@ if __name__ == '__main__':
     bolds = np.lib.format.open_memmap('bolds.npy')
 
     pl.figure()
-    for i in range(25):
-        pl.subplot(5, 5, i + 1)
-        pl.plot(rs[::100, ::100, i], 'k', alpha=0.1)
+    for i in range(rs.shape[-1]):
+        pl.subplot(2, 4, i + 1)
+        pl.plot(rs[:100, ::100, i], 'k', alpha=0.1)
 
-    pl.suptitle('r')
-    pl.tight_layout()
-    pl.figure()
-    for i in range(25):
-        pl.subplot(5, 5, i + 1)
-        pl.plot(bolds[:, ::100, i], 'k', alpha=0.1)
-
-    pl.suptitle('bold')
     pl.tight_layout()
     pl.show()
