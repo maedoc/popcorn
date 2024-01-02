@@ -4,71 +4,43 @@ A hi-res MPR w/ two sparse coupling matrices.
 """
 
 import numpy as np
-import scipy.io
+import scipy.sparse
 import tqdm
-import pyopencl as cl
+from clutils import *
 import pyopencl.array as ca
-import pyopencl.clrandom as cr
 
 
-class Util:
-
-    def __init__(self):
-        self.init_cl()
-        self._progs = []
-
-    def init_cl(self):
-        self.platform = cl.get_platforms()[0]
-        self.device = self.platform.get_devices(device_type=cl.device_type.GPU)[0]
-        self.context = cl.Context([self.device])
-        self.queue = cl.CommandQueue(self.context)
-        self.rng = cr.PhiloxGenerator(self.context)
-
-    def randn(self, *shape, mu=0, sigma=1):
-        return self.rng.normal(cq=self.queue, dtype='f', shape=shape, mu=mu, sigma=sigma)
-
-    def zeros(self, *shape):
-        return ca.zeros(self.queue, shape, dtype='f')
-
-    def init_vectors(self, names, shape, method='zeros', **kwargs):
-        for name in names.split(' '):
-            setattr(self, name, getattr(self, method)(*shape, **kwargs))
-
-    def load_kernel(self, fname, *knames):
-        with open(fname, 'r') as f:
-            src = f.read()
-        prog = cl.Program(self.context, src).build()
-        self._progs.append(prog)
-        for kname in knames:
-            setattr(self, kname, getattr(prog, kname))
-
-    def move_csr(self, name, csr):
-        setattr(self, name + '_data', ca.to_device(self.queue, csr.data))
-        setattr(self, name + '_indices', ca.to_device(self.queue, csr.indices))
-        setattr(self, name + '_indptr', ca.to_device(self.queue, csr.indptr))
-
-
-def make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale):
+def make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale):
     "Setup functions for time stepping."
 
     # CL kernels expect float32 scalars
     dt = np.float32(dt)
+    nh_r = iL.max() + 1
+    nh_v = iG.max() + 1
+
+    # max delay determines buffer size
+    print((nh_r + nh_v) * nvtx * num_sims * 4 >> 20, 'min buf size')
 
     util = Util()
     # allocate required memory for states & Heun integration
     util.init_vectors('nr nV r V ri Vi cr cV dr1 dV1 dr2 dV2 zr zV bold', (nvtx, num_sims))
+    # alloc delay buffers
+    util.init_vectors('rbuf', (nh_r, nvtx, num_sims))
+    util.rbuf[:] = np.float32(0.1)
+    util.init_vectors('vbuf', (nh_v, nvtx, num_sims))
+    util.vbuf[:] = np.float32(-2.0)
     # alloc balloon state
     util.init_vectors('dsfvq1 dsfvq2 sfvqi sfvq zsfvq', (4, nvtx, num_sims))
     util.sfvq[1:] = np.float32(1.0)
     # eta is the only varying parameter for now
     util.init_vectors('params', (nvtx, num_sims), 'randn', mu=-6.0, sigma=0.1)
     # move sparse matrix data to GPU
-    util.move_csr('sc', SC)
-    util.move_csr('lc', LC)
+    util.move_csr(W=W, K=K)
+    util.move(iL=iL, iG=iG)
     # load kernels
-    util.load_kernel('./spmv.opencl.c', 'spmv')
+    util.load_kernel('./delays.opencl.c', 'delays_batched', N=32, B=num_sims)
     util.load_kernel('./mpr.opencl.c', 'mpr_dfun')
-    util.load_kernel('./heun.opencl.c', 'heun_pred', 'heun_corr')
+    util.load_kernel('./heun.opencl.c', 'heun_pred', 'heun_corr', 'rgt0')
     util.load_kernel('./balloon.opencl.c', 'balloon_dfun', 'balloon_readout')
 
     # handle boilerplate for kernel launches
@@ -76,36 +48,75 @@ def make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale):
         args = [(arg.data if hasattr(arg, 'data') else arg) for arg in args]
         f(util.queue, (nvtx, num_sims), (1, num_sims), *args)
 
-    def coupling(cr, cV, r, V):
+    def coupling(t, cr, cV, r, V):
         "Compute coupling terms."
-        # global coupling transmits rate information
-        do(util.spmv, cr, r, util.sc_data, util.sc_indices, util.sc_indptr)
-        # local coupling transmits potential
-        do(util.spmv, cV, V, util.lc_data, util.lc_indices, util.lc_indptr)
 
-    def dfun(dr, dV, r, V):
+        # delays_batched(nvtx, nh, t, out, buf, weights, idelays, indices, indptr)
+        t = np.int32(t)
+
+        # global coupling transmits rate information
+        import pdb; pdb.set_trace()
+        do(util.delays_batched, np.int32(nvtx), np.int32(nh_r), t, cr, util.rbuf,
+                util.W_data, util.iL, util.W_indices, util.W_indptr)
+        # local coupling transmits potential
+        #do(util.delays_batched, np.int32(nvtx), np.int32(nh_v), t, cV, util.vbuf,
+        #        util.K_data, util.iG, util.K_indices, util.K_indptr)
+
+    def numpy_delays(buf,nh,t,idelays,indices,weights,indptr,c):
+        xij = buf[(nh + t - idelays) % nh, indices]
+        wxij = xij*weights.reshape(-1, 1)
+        wxij = np.r_[wxij, np.zeros((1, num_sims), 'f')]
+        np.add.reduceat(wxij, indptr[:-1], axis=0, out=c)
+        c[np.argwhere(np.diff(indptr)==0)] = 0
+
+    def dfun(t, dr, dV, r, V):
         "Compute MPR derivatives."
-        coupling(util.cr, util.cV, r, V)
+        if True:
+            util.cr[:] = 0.0
+            coupling(t, util.cr, util.cV, r, V)
+            cr1 = util.cr.get()
+            cr2 = np.zeros_like(cr1)
+
+            numpy_delays(util.rbuf.get(), nh_r, t, iL, W.indices, W.data, W.indptr, cr2)
+
+            if t % 10 == 0:
+                print('cr1 finite', np.isfinite(cr1).all())
+                print('cr2 finite', np.isfinite(cr2).all())
+                err = np.abs(cr1 - cr2)
+                print(err)
+
+                import pylab as pl
+                pl.semilogy(err + 1e-9, ',')
+                pl.show()
+
         do(util.mpr_dfun, dr, dV, r, V, util.cr, util.cV, util.params)
 
-    def step():
+    def step(t):
         "Do one Heun step."
+
+        # update rbuf & vbuf
+        util.rbuf[t%nh_r] = util.r
+        util.vbuf[t%nh_v] = util.V
+
         # sample noise
-        util.rng.fill_normal(util.zr, sigma=r_noise_scale)
+        #util.rng.fill_normal(util.zr, sigma=r_noise_scale)
 
         # predictor step computes dr1,dV1 from states r,V
-        dfun(util.dr1, util.dV1, util.r, util.V)
+        dfun(t, util.dr1, util.dV1, util.r, util.V)
 
         # and puts Euler result into intermediate arrays ri,Vi
         do(util.heun_pred, dt, util.ri, util.r, util.dr1, util.zr)
+        do(util.rgt0, util.ri)
         do(util.heun_pred, dt, util.Vi, util.V, util.dV1, util.zV)
 
         # corrector step computes dr2,dV2 from intermediate states ri,Vi
-        dfun(util.dr2, util.dV2, util.ri, util.Vi)
+        dfun(t+1, util.dr2, util.dV2, util.ri, util.Vi)
 
         # and writes Heun result into arrays r,V
         do(util.heun_corr, dt, util.r, util.r, util.dr1, util.dr2, util.zr)
+        do(util.rgt0, util.r)
         do(util.heun_corr, dt, util.V, util.V, util.dV1, util.dV2, util.zV)
+
 
     def bold_step(dt):
         "Do one step of the balloon model."
@@ -121,31 +132,53 @@ def make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale):
     return util, step, bold_step
 
 
+def load_npz_to_csr(npz_fname):
+    npz = np.load(npz_fname)
+    csr = scipy.sparse.csr_matrix(
+        (npz['data'], npz['indices'], npz['indptr']),
+        shape=npz['shape'])
+    return csr.astype('f')
+
+
 def main():
 
     # load the global and local connectivity matrices
-    mat = scipy.io.loadmat('matrices.mat')
-    SC = mat['SC']
-    LC = mat['LC']
+    G = load_npz_to_csr('vert2vert_gdist_mat_32k.npz')
+    L = load_npz_to_csr('vert2vert_lengths_32k_15M.npz')
+    W = load_npz_to_csr('vert2vert_weights_32k_15M.npz')
+    assert G.shape == L.shape == W.shape
+    assert np.allclose(W.indices, L.indices)
+    assert np.allclose(W.indptr, L.indptr)
 
-    if False:
+    if True:
         # for testing, can run just a subset of the network, like first 512
         # vertices, but could also be a mask selecting just 5 regions, etc.
-        nvtx = 512
-        SC = SC[:nvtx, :nvtx]
-        LC = LC[:nvtx, :nvtx]
-        print('reduced network shape to', SC.shape, LC.shape)
+        nvtx = 10*1024
+        G = G[:nvtx][:,:nvtx]
+        L = L[:nvtx][:,:nvtx]
+        W = W[:nvtx][:,:nvtx]
+        print('reduced network shape to', G.shape, L.shape, W.shape)
 
     dt = 0.1
     r_noise_scale = 0.1
-    nvtx = SC.shape[0]
-    num_sims = 256
+    nvtx = L.shape[0]
+    num_sims = 1
+
+    # make lc kernel from gdist
+    K = G.copy()
+    K.data = np.exp(-K.data/5.0).astype('f')
+
+    # prepare extra info for delays
+    local_velocity = 1.0
+    v2v_velocity = 10.0
+    iG = (G.data / local_velocity / dt).astype('i') # rounds down
+    iL = (L.data / v2v_velocity / dt).astype('i')
 
     # prepare the GPU arrays and stepping function
-    util, step, bold_step = make_step(nvtx, num_sims, SC, LC, dt, r_noise_scale)
+    util, step, bold_step = make_step(nvtx, num_sims, W, iL, K, iG, dt, r_noise_scale)
 
     # set initial conditions
-    util.rng.fill_normal(util.r, mu=0.1, sigma=0.2)
+    util.rng.fill_uniform(util.r, a=0.00001, b=0.2)
     util.rng.fill_normal(util.V, mu=-2.1, sigma=0.2)
 
     # simulation times
@@ -154,8 +187,8 @@ def main():
     minute = int(60e3 / dt)
 
     # neural field iterations & output storage
-    niter = 15*minute  # this many iterations
-    nskip = int(10/dt)       # but only save every nskip iterations to file
+    niter = 2000 # minute  # this many iterations
+    nskip = 1 #int(10/dt)       # but only save every nskip iterations to file
     rs_shape = niter//nskip+1, nvtx, num_sims
     print(f'output rs.npy ~{(np.prod(rs_shape)*4) >> 30} GB')
     rs = np.lib.format.open_memmap(
@@ -173,7 +206,7 @@ def main():
 
     # do time stepping
     for i in tqdm.trange(niter):
-        step()
+        step(i)
         # bold is slow, don't step it every time
         if i % bold_dtskip == 0:
             bold_step(dt*1e-3*bold_dtskip)
@@ -198,17 +231,9 @@ if __name__ == '__main__':
     bolds = np.lib.format.open_memmap('bolds.npy')
 
     pl.figure()
-    for i in range(25):
-        pl.subplot(5, 5, i + 1)
-        pl.plot(rs[::100, ::100, i], 'k', alpha=0.1)
+    for i in range(rs.shape[-1]):
+        pl.subplot(2, 4, i + 1)
+        pl.plot(rs[:100, ::100, i], 'k', alpha=0.1)
 
-    pl.suptitle('r')
-    pl.tight_layout()
-    pl.figure()
-    for i in range(25):
-        pl.subplot(5, 5, i + 1)
-        pl.plot(bolds[:, ::100, i], 'k', alpha=0.1)
-
-    pl.suptitle('bold')
     pl.tight_layout()
     pl.show()

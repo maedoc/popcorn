@@ -1,0 +1,4 @@
+BootStrap: docker
+From: ubuntu:23.10
+%post
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pyopencl python3-matplotlib python3-scipy pocl-opencl-icd
