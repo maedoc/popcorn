@@ -74,19 +74,26 @@ void delays2_upbuf(int nv, int nh, int t,
 // batch variant
 void delays2_batch(int bs, int nv, int nh, int t,
              float *out1, float *out2,
-             float *buf, float *weights, int *idelays, int *indices, int *indptr
+             float *buf, float *weights, int *idelays, int *indices, int *indptr,
+             float *x
              )
 {
     // nh is power of two, so x&(nh-1) is faster way to compute x%nh
     int nhm = nh - 1;
-    float acc[64]; // assume bs<=32
 
-#pragma omp parallel for private(acc)
+#pragma omp parallel for
     for (int i=0; i<nv; i++)
     {
+    // update buffer
+            /*
 #pragma omp simd
         for (int l=0; l<bs; l++)
-            acc[l] = acc[bs+l] = 0.0f;
+            buf[(i*nh + ((nh + t) & nhm))*bs + l] = x[i*bs + l];
+            */
+
+#pragma omp simd
+        for (int l=0; l<bs; l++)
+            out1[bs*i+l] = out2[bs*i+l] = 0.0f;
         
         for (int j=indptr[i]; j<indptr[i+1]; j++)
         {
@@ -95,20 +102,14 @@ void delays2_batch(int bs, int nv, int nh, int t,
             int roll_t = nh + t - idelays[j];
             float *b1 = b + ((roll_t+0) & nhm)*bs;
             float *b2 = b + ((roll_t+1) & nhm)*bs;
+
             
 #pragma omp simd
             for (int l=0; l<bs; l++)
             {
-                acc[   l] += w * b1[l];
-                acc[bs+l] += w * b2[l];
+                out1[bs*i + l] += w * b1[l];
+                out2[bs*i + l] += w * b2[l];
             }
-        }
-
-#pragma omp simd
-        for (int l=0; l<bs; l++)
-        {
-            out1[bs*i+l] = acc[   l];
-            out2[bs*i+l] = acc[bs+l];
         }
     }
 }
