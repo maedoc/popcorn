@@ -71,10 +71,6 @@ void delays2_upbuf(int nv, int nh, int t,
     }
 }
 
-int omp_get_thread_num(void);
-int omp_get_num_threads(void);
-#include <stdlib.h>
-
 // batch variant
 void delays2_batch(int bs, int nv, int nh, int t,
              float *out1, float *out2,
@@ -83,15 +79,12 @@ void delays2_batch(int bs, int nv, int nh, int t,
 {
     // nh is power of two, so x&(nh-1) is faster way to compute x%nh
     int nhm = nh - 1;
-    int ot = omp_get_thread_num();
-    int oT = omp_get_num_threads();
-    float *all_acc = (float*) malloc(oT*2*bs*sizeof(float));
+    float acc[64]; // assume bs<=32
 
-#pragma omp parallel for
+#pragma omp parallel for private(acc)
     for (int i=0; i<nv; i++)
     {
-        float *acc = all_acc + ot*2*bs;
-
+#pragma omp simd
         for (int l=0; l<bs; l++)
             acc[l] = acc[bs+l] = 0.0f;
         
@@ -103,6 +96,7 @@ void delays2_batch(int bs, int nv, int nh, int t,
             float *b1 = b + ((roll_t+0) & nhm)*bs;
             float *b2 = b + ((roll_t+1) & nhm)*bs;
             
+#pragma omp simd
             for (int l=0; l<bs; l++)
             {
                 acc[   l] += w * b1[l];
@@ -110,14 +104,13 @@ void delays2_batch(int bs, int nv, int nh, int t,
             }
         }
 
+#pragma omp simd
         for (int l=0; l<bs; l++)
         {
             out1[bs*i+l] = acc[   l];
             out2[bs*i+l] = acc[bs+l];
         }
     }
-
-    free(all_acc);
 }
 
 

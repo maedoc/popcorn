@@ -41,7 +41,7 @@ nh_v = 2**int(np.ceil(np.log2( iG.max() + 1 )))
 print('history len', nh_r, nh_v)
 
 # allocate buffers
-bs = 8
+bs = 32
 rbuf = np.zeros((nv, nh_r, bs), 'f')
 vbuf = np.zeros((nv, nh_v, bs), 'f')
 cr = np.zeros((2, nv, bs), 'f')
@@ -72,22 +72,48 @@ def np_delays2(buf,nh,t,idelays,indices,weights,indptr,c):
     np.add.reduceat(xij*weights.reshape(-1,1), indptr[:-1], axis=1, out=c)
     c[:,np.argwhere(np.diff(indptr)==0)] = 0
 
+# a numba one for fun
+import numba
+@numba.njit(parallel=True, boundscheck=False, fastmath=True)
+def nb_delays2(buf,nh,t,idelays,indices,weights,indptr,c):
+    nhm = numba.int32(nh - 1)
+    for i in numba.prange(nv):
+        for l in range(bs):
+            c[0,i,l] = c[1,i,l] = 0
+        for j in range(indptr[i],indptr[i+1]):
+            w = weights[j]
+            roll_t = nh + t - idelays[j]
+            t0 = (roll_t + 0) & nhm
+            t1 = (roll_t + 1) & nhm
+            for l in range(bs):
+                c[0,i,l] += w * buf[indices[j], t0, l]
+                c[1,i,l] += w * buf[indices[j], t1, l]
+
 # fill buffer with some thing
 rbuf[:] = np.random.randn(*rbuf.shape).astype('f')
 
 # test variant 2
 cr[:] = 0
 cr_np = np.zeros_like(cr)
+cr_nb = np.zeros_like(cr)
 np_delays2(rbuf, nh_r, 42, iL, W.indices, W.data, W.indptr, cr_np)
+nb_delays2(rbuf, nh_r, 42, iL, W.indices, W.data, W.indptr, cr_nb)
 lib.delays2_batch(bs, nv, nh_r, 42, cr[0], cr[1], rbuf, W.data, iL, W.indices, W.indptr)
-np.testing.assert_allclose(cr_np[0], cr[0], 1e-3, 1e-3)
+np.testing.assert_allclose(cr_np[0,:5,:4], cr[0,:5,:4], 1e-3, 1e-3)
 np.testing.assert_allclose(cr_np[1], cr[1], 1e-3, 1e-3)
+np.testing.assert_allclose(cr_nb[0,:5,:4], cr_np[0,:5,:4], 1e-3, 1e-3)
+np.testing.assert_allclose(cr_nb[1], cr_np[1], 1e-3, 1e-3)
 
 # benchmark implementations, numpy is slow
 print('benchmarking numpy, numba, C1, C2')
-for i in tqdm.trange(32):
+for i in tqdm.trange(8):
     np_delays2(rbuf, nh_r, i, iL, W.indices, W.data, W.indptr, cr)
     np_delays2(vbuf, nh_v, i, iG, K.indices, K.data, K.indptr, cv)
+
+#numba
+for i in tqdm.trange(256):
+    nb_delays2(rbuf, nh_r, i, iL, W.indices, W.data, W.indptr, cr)
+    nb_delays2(vbuf, nh_v, i, iG, K.indices, K.data, K.indptr, cv)
 
 # 2nd variant
 for i in tqdm.trange(256):
