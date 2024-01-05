@@ -41,7 +41,7 @@ nh_v = 2**int(np.ceil(np.log2( iG.max() + 1 )))
 print('history len', nh_r, nh_v)
 
 # allocate buffers
-bs = 32
+bs = 256
 rbuf = np.zeros((nv, nh_r, bs), 'f')
 vbuf = np.zeros((nv, nh_v, bs), 'f')
 cr = np.zeros((2, nv, bs), 'f')
@@ -112,6 +112,8 @@ rbuf[:] = np.random.randn(*rbuf.shape).astype('f')
 x = np.random.randn(nv, bs).astype('f')
 x = x*(x>0.5)
 
+print('rbuf size', rbuf.nbytes >> 20, 'MB')
+
 # test variant 2
 cr[:] = 0
 cr_np = np.zeros_like(cr)
@@ -119,7 +121,8 @@ cr_nb = np.zeros_like(cr)
 cr_cu = np.zeros_like(cr)
 np_delays2(rbuf, nh_r, 42, iL, W.indices, W.data, W.indptr, cr_np)
 nb_delays2(rbuf, nh_r, 42, iL, W.indices, W.data, W.indptr, cr_nb)
-cu_delays2[nv // 32 + 1, (32, bs)](rbuf, nh_r, 42, iL, W.indices, W.data, W.indptr, cr_cu)
+gs = 1024 // bs
+cu_delays2[nv // gs + 1, (gs, bs)](rbuf, nh_r, 42, iL, W.indices, W.data, W.indptr, cr_cu)
 lib.delays2_batch(bs, nv, nh_r, 42, cr[0], cr[1], rbuf, W.data, iL, W.indices, W.indptr, x)
 np.testing.assert_allclose(cr_np[0,:5,:4], cr[0,:5,:4], 1e-3, 1e-3)
 np.testing.assert_allclose(cr_np[1], cr[1], 1e-3, 1e-3)
@@ -131,8 +134,8 @@ np.testing.assert_allclose(cr_nb[1], cr_cu[1], 1e-3, 1e-3)
 
 
 # benchmark implementations, numpy is slow
-print('benchmarking numpy, numba, C1, C2')
-for i in tqdm.trange(8):
+print('benchmarking numpy, numba, numba cuda, C 1 instance, C full batch')
+for i in tqdm.trange(2):
     np_delays2(rbuf, nh_r, i, iL, W.indices, W.data, W.indptr, cr)
     np_delays2(vbuf, nh_v, i, iG, K.indices, K.data, K.indptr, cv)
 
@@ -141,20 +144,16 @@ for i in tqdm.trange(256):
     nb_delays2(rbuf, nh_r, i, iL, W.indices, W.data, W.indptr, cr)
     nb_delays2(vbuf, nh_v, i, iG, K.indices, K.data, K.indptr, cv)
 
-"""
 _rbuf, _iL, _W_indices, _W_data, _W_indptr, _cr = [
         numba.cuda.to_device(_) for _ in
         [rbuf, iL, W.indices, W.data, W.indptr, cr]]
 _vbuf, _iG, _K_indices, _K_data, _K_indptr, _cv = [
         numba.cuda.to_device(_) for _ in
         [vbuf, iG, K.indices, K.data, K.indptr, cv]]
-gs = 32
 for i in tqdm.trange(256):
     cu_delays2[nv // gs + 1, (gs, bs)](_rbuf, nh_r, i, _iL, _W_indices, _W_data, _W_indptr, _cr)
     cu_delays2[nv // gs + 1, (gs, bs)](_vbuf, nh_v, i, _iG, _K_indices, _K_data, _K_indptr, _cv)
-    cr = _cr.copy_to_host()
-    cv = _cv.copy_to_host()
-"""
+    numba.cuda.synchronize()
 
 # 2nd variant
 for i in tqdm.trange(256):
